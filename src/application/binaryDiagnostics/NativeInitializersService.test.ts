@@ -9,6 +9,8 @@ import {
   AnalysisInputError,
   AnalysisOutputError,
 } from "../../domain/analysisErrorCore.js";
+import { readNativeInitializers } from "../../native/initializers/NativeInitializersProvider.js";
+import { machoArm64FatInitializers } from "../../native/initializers/NativeInitializers.fixture.js";
 
 const identity = NATIVE_INITIALIZERS_PROVIDER;
 const report: NativeInitializers = {
@@ -91,6 +93,48 @@ it("records the selected image and each slot range as Evidence", async () => {
   });
 });
 
+it.each(["arm64", "x86_64", undefined] as const)(
+  "binds a universal initializer report to the caller's architecture %s",
+  async (architecture) => {
+    const bytes = machoArm64FatInitializers();
+    const parsed = await readNativeInitializers(
+      bytes,
+      { ...report.artifact, bytes: bytes.length },
+      {
+        path: report.artifact.path,
+        offset: 0,
+        limit: 64,
+        architecture: "arm64",
+      },
+    );
+    const result = await serviceFor(parsed).inspect({
+      path: report.artifact.path,
+      ...(architecture === undefined ? {} : { architecture }),
+    });
+    expect(result.ok).toBe(architecture === "arm64");
+    if (!result.ok) {
+      expect(result.error).toBeInstanceOf(AnalysisOutputError);
+      return;
+    }
+    expect(result.value).toMatchObject({
+      subject: { format: "mach-o-universal", architecture: "arm64" },
+      normalized_result: parsed,
+      parameters: { architecture: "arm64" },
+    });
+  },
+);
+
+it("rejects an architecture selection when the report has no universal slice", async () => {
+  const result = await serviceFor(report).inspect({
+    path: report.artifact.path,
+    architecture: "arm64",
+  });
+  expect(result).toMatchObject({
+    ok: false,
+    error: { _tag: "AnalysisOutputError" },
+  });
+});
+
 it.each([
   ["a page that does not match the request", { offset: 1 }],
   ["a returned count that differs from the entries", { returned_entries: 0 }],
@@ -116,7 +160,7 @@ it("rejects a slot offset outside the artifact", async () => {
 
 it("retains a completed observation when the caller cancels as the provider completes", async () => {
   const controller = new AbortController();
-  const reason = { request: "late NativeInitializers cancellation" };
+  const reason = { request: "late native initializer cancellation" };
   const service = new NativeInitializersService({
     identity,
     inspect: () => {
@@ -136,3 +180,80 @@ it("retains a completed observation when the caller cancels as the provider comp
     normalized_result: report,
   });
 });
+
+it.each([
+  { machine: 0x01000007 },
+  { architecture: "x86_64" as const },
+  { format: "elf" as const },
+])(
+  "refuses contradictory selected-image facts %j before Evidence",
+  async (changes) => {
+    const bytes = machoArm64FatInitializers();
+    const selected = await readNativeInitializers(
+      bytes,
+      { ...report.artifact, bytes: bytes.length },
+      {
+        path: report.artifact.path,
+        offset: 0,
+        limit: 64,
+        architecture: "arm64",
+      },
+    );
+    const result = await serviceFor({ ...selected, ...changes }).inspect({
+      path: report.artifact.path,
+      architecture: "arm64",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "AnalysisOutputError" },
+    });
+  },
+);
+
+it.each([
+  { label: "ends at EOF", extraOffset: 0, extraSize: 0, accepted: true },
+  {
+    label: "starts one byte too late",
+    extraOffset: 1,
+    extraSize: 0,
+    accepted: false,
+  },
+  {
+    label: "extends one byte too far",
+    extraOffset: 0,
+    extraSize: 1,
+    accepted: false,
+  },
+])(
+  "binds the selected slice extent when it $label",
+  async ({ extraOffset, extraSize, accepted }) => {
+    const bytes = machoArm64FatInitializers();
+    const selected = await readNativeInitializers(
+      bytes,
+      { ...report.artifact, bytes: bytes.length },
+      {
+        path: report.artifact.path,
+        offset: 0,
+        limit: 64,
+        architecture: "arm64",
+      },
+    );
+    if (selected.slice === null)
+      throw new Error("Expected the authored universal slice");
+    const value = {
+      ...selected,
+      slice: {
+        ...selected.slice,
+        file_offset:
+          selected.artifact.bytes - selected.slice.size + extraOffset,
+        size: selected.slice.size + extraSize,
+      },
+    };
+    const result = await serviceFor(value).inspect({
+      path: report.artifact.path,
+      architecture: "arm64",
+    });
+    expect(result.ok).toBe(accepted);
+    if (!result.ok) expect(result.error).toBeInstanceOf(AnalysisOutputError);
+  },
+);
